@@ -10,18 +10,31 @@ from argparse import ArgumentParser
 pattern = re.compile(r"https?:\/\/([\w-]+\.)+[a-z]{2,5}[\w\-\/#\?&]*")
 
 
+class AppUrlMergeError(RuntimeError):
+
+    def __init__(self, *args):
+        RuntimeError.__init__(self, args)
+
+
 class AppUrl:
 
     def __init__(self, url_str: str):
         if url_str != None:
             self.url = url_str.split(sep="?")[0].split(sep="#")[0]
+            self.anchors, self.param_strings = set(), set()
             if "#" in url_str:
-                self.anchors = [url_str.split(
-                    sep="#")[1].split(sep="?")[0]]
+                self.anchors.update([url_str.split(
+                    sep="#")[1].split(sep="?")[0]])
             if "?" in url_str:
-                self.param_strings = [url_str.split(sep="?")[1]]
+                self.param_strings.update([url_str.split(sep="?")[1]])
         else:
             self.url = ""
+
+    def merge(self, app_url):
+        if not self.url == app_url.url:
+            raise AppUrlMergeError
+        self.anchors.update(app_url.anchors)
+        self.param_strings.update(app_url.param_strings)
 
     def __eq__(self, other):
         return other and self.url == other.url
@@ -35,16 +48,12 @@ class AppUrl:
     def __str__(self):
         val = self.url
 
-        try:
-            if len(self.anchors) > 0:
-                val += "#" + self.anchors[0]
-        except AttributeError:
-            pass
-        try:
-            if len(self.param_strings) > 0:
-                val += "?" + self.param_strings[0]
-        except AttributeError:
-            pass
+        if len(self.anchors) > 0:
+            val += "#" + str(self.anchors)
+
+        if len(self.param_strings) > 0:
+            val += "?" + str(self.param_strings)
+
         return val
 
     def __repr__(self):
@@ -52,12 +61,12 @@ class AppUrl:
 
         try:
             if len(self.anchors) > 0:
-                val += "#" + self.anchors[0]
+                val += "#({})".format("|".join(self.anchors))
         except AttributeError:
             pass
         try:
             if len(self.param_strings) > 0:
-                val += "?" + self.param_strings[0]
+                val += "?({})".format("|".join(self.param_strings))
         except AttributeError:
             pass
         return val
@@ -89,11 +98,25 @@ def get_links_in_script(url):
     return [AppUrl(u.group(0)) for u in re.finditer(pattern, response.text)]
 
 
-def crawler(base_url: AppUrl, scope, driver, **options):
+def get_robots_file_urls(path):
+    response = requests.get(path)
+    disallowed = [line[len("Disallow:"):].strip(
+        "\r") for line in response.text.split(sep="\n") if line.startswith("Disallow")]
+    allowed = [line[len("Allow:"):].strip("\r") for line in response.text.split(
+        sep="\n") if line.startswith("Allow")]
+    return [line for line in disallowed + allowed if not "*" in line]
+
+
+def get_sitemap_file(path):
+    response = requests.get(path)
+    print(response.text)
+
+
+def crawler(base_urls: list[AppUrl], scope, driver, **options):
     if "scan_out_of_scope_scripts" not in options:
         options["scan_out_of_scope_scripts"] = True
 
-    urls_to_fetch, fetched_urls = set([base_url]), set()
+    urls_to_fetch, fetched_urls = set(base_urls), set()
     while len(urls_to_fetch) > 0:
         app_url = urls_to_fetch.pop()
         try:
@@ -103,6 +126,8 @@ def crawler(base_url: AppUrl, scope, driver, **options):
         fetched_urls.add(app_url)
         links = set()
 
+        registered_links = dict()
+
         for el in driver.find_elements_by_tag_name("a"):
             try:
                 link = AppUrl(el.get_attribute("href"))
@@ -110,6 +135,11 @@ def crawler(base_url: AppUrl, scope, driver, **options):
                     if options["verbosity"]:
                         print(link)
                     links.add(link)
+                elif len(link) > 0 and in_scope(scope, link.url) and link in fetched_urls.union(urls_to_fetch):
+                    if link.url in registered_links:
+                        registered_links[link.url].merge(link)
+                    else:
+                        registered_links[link.url] = link
             except StaleElementReferenceException:
                 continue
 
@@ -120,14 +150,26 @@ def crawler(base_url: AppUrl, scope, driver, **options):
                 # shorthand for options["scan_out_of_scope_scripts"]
                 opt = options["scan_out_of_scope_scripts"]
                 if len(src) > 0 and ((not opt and in_scope(scope, src.url)) or opt):
-                    new_links = [link for link in get_links_in_script(
-                        src) if in_scope(scope, link.url) and link not in fetched_urls.union(links).union(urls_to_fetch) and len(link) > 0]
+
+                    found_links = [link for link in get_links_in_script(src) if in_scope(
+                        scope, link.url)]
+
+                    new_links = [link for link in found_links if link not in fetched_urls.union(
+                        links).union(urls_to_fetch) and len(link) > 0]
                     if len(new_links) > 0:
                         if options["verbosity"]:
                             print(
                                 "\n".join([str(l) for l in new_links if l not in links and l not in urls_to_fetch and len(l) > 0]))
 
                         links.update(new_links)
+
+                    for link in [link for link in found_links if link in fetched_urls.union(
+                            links).union(urls_to_fetch)]:
+                        if link.url in registered_links:
+                            registered_links[link.url].merge(link)
+                        else:
+                            registered_links[link.url] = link
+
             except StaleElementReferenceException:
                 continue
 
@@ -180,15 +222,18 @@ def parseArgs():
 if __name__ == "__main__":
     url, scope, driver, options = parseArgs()
     options["verbosity"] = True
+    urls = [AppUrl(url)]
+
     try:
-        crawler(AppUrl(url), scope, driver, **options)
+        urls += [AppUrl(url)
+                 for url in get_robots_file_urls(re.match(r"https?:\/\/([\w-]+\.)+[a-z]{2,5}", url).group(0)+"/robots.txt")]
+        crawler(urls, scope, driver, **options)
     except Exception as e:
         print(e, file=sys.stderr)
-        driver.close()
-        sys.exit(-1)
 
-    except KeyboardInterrupt:
-        driver.close()
-        sys.exit(-1)
+    except BaseException:
+        pass
+
     finally:
+        print("closing driver...", file=sys.stderr)
         driver.close()
