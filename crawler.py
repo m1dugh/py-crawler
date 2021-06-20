@@ -3,11 +3,12 @@ from selenium import webdriver
 from selenium.common.exceptions import WebDriverException, StaleElementReferenceException
 import re
 import requests
+from requests.exceptions import RequestException
 import json
 from argparse import ArgumentParser
 
 
-pattern = re.compile(r"https?:\/\/([\w-]+\.)+[a-z]{2,5}[\w\-\/#\?&]*")
+pattern = re.compile(r"https?:\/\/([\w\-]+\.)+[a-z]{2,5}[^\s\"\']*")
 
 
 class AppUrlMergeError(RuntimeError):
@@ -94,17 +95,30 @@ def in_scope(scope, url):
 
 
 def get_links_in_script(url):
-    response = requests.get(url)
-    return [AppUrl(u.group(0)) for u in re.finditer(pattern, response.text)]
+    try:
+        response = requests.get(url)
+        return [AppUrl(u.group(0)) for u in re.finditer(pattern, response.text)]
+    except RequestException:
+        return []
 
 
-def get_robots_file_urls(path):
-    response = requests.get(path)
-    disallowed = [line[len("Disallow:"):].strip(
-        "\r") for line in response.text.split(sep="\n") if line.startswith("Disallow")]
-    allowed = [line[len("Allow:"):].strip("\r") for line in response.text.split(
-        sep="\n") if line.startswith("Allow")]
-    return [line for line in disallowed + allowed if not "*" in line]
+def get_robots_file_urls(path: str, exact_path=False):
+    root_url = re.match(
+        r"https?:\/\/([\w-]+\.)+[a-z]{2,5}", path).group(0)
+    if exact_path:
+        effective_url = path
+    else:
+        effective_url = root_url+"/robots.txt"
+
+    try:
+        response = requests.get(effective_url)
+        disallowed = [line[len("Disallow:"):].strip(
+            "\r") for line in response.text.split(sep="\n") if line.startswith("Disallow")]
+        allowed = [line[len("Allow:"):].strip("\r") for line in response.text.split(
+            sep="\n") if line.startswith("Allow")]
+        return [AppUrl(f"{root_url}/{line}") for line in disallowed + allowed if not "*" in line]
+    except RequestException:
+        return []
 
 
 def get_sitemap_file(path):
@@ -112,69 +126,89 @@ def get_sitemap_file(path):
     print(response.text)
 
 
-def crawler(base_urls: list[AppUrl], scope, driver, **options):
-    if "scan_out_of_scope_scripts" not in options:
-        options["scan_out_of_scope_scripts"] = True
+class Crawler:
 
-    urls_to_fetch, fetched_urls = set(base_urls), set()
-    while len(urls_to_fetch) > 0:
-        app_url = urls_to_fetch.pop()
-        try:
-            driver.get(app_url.url)
-        except WebDriverException:
-            continue
-        fetched_urls.add(app_url)
-        links = set()
+    def __init__(self, base_urls: list[AppUrl], scope, driver, on_url_found=None, **options):
+        self.base_urls = base_urls
+        self.scope = scope
+        self.driver = driver
+        self.options = options
+        self.urls_to_fetch, self.fetched_urls = set(self.base_urls), set()
+        self.on_url_found = on_url_found
+        self.__parse_options()
 
-        registered_links = dict()
+    def __parse_options(self):
+        if "scan_all_scripts" not in self.options:
+            self.options["scan_all_scripts"] = True
 
-        for el in driver.find_elements_by_tag_name("a"):
+    def pause(self):
+        self.__running = False
+
+    def crawl(self):
+        self.__running = True
+        while len(self.urls_to_fetch) > 0 and self.__running:
+            app_url = self.urls_to_fetch.pop()
             try:
-                link = AppUrl(el.get_attribute("href"))
-                if len(link) > 0 and in_scope(scope, link.url) and link not in fetched_urls.union(urls_to_fetch):
-                    if options["verbosity"]:
-                        print(link)
-                    links.add(link)
-                elif len(link) > 0 and in_scope(scope, link.url) and link in fetched_urls.union(urls_to_fetch):
-                    if link.url in registered_links:
-                        registered_links[link.url].merge(link)
-                    else:
-                        registered_links[link.url] = link
-            except StaleElementReferenceException:
+                self.driver.get(app_url.url)
+            except WebDriverException:
                 continue
+            finally:
+            	self.fetched_urls.add(app_url)
+            links = set()
 
-        for script in driver.find_elements_by_tag_name("script"):
-            try:
-                src = AppUrl(script.get_attribute("src"))
+            registered_links = dict()
 
-                # shorthand for options["scan_out_of_scope_scripts"]
-                opt = options["scan_out_of_scope_scripts"]
-                if len(src) > 0 and ((not opt and in_scope(scope, src.url)) or opt):
-
-                    found_links = [link for link in get_links_in_script(src) if in_scope(
-                        scope, link.url)]
-
-                    new_links = [link for link in found_links if link not in fetched_urls.union(
-                        links).union(urls_to_fetch) and len(link) > 0]
-                    if len(new_links) > 0:
-                        if options["verbosity"]:
-                            print(
-                                "\n".join([str(l) for l in new_links if l not in links and l not in urls_to_fetch and len(l) > 0]))
-
-                        links.update(new_links)
-
-                    for link in [link for link in found_links if link in fetched_urls.union(
-                            links).union(urls_to_fetch)]:
+            for el in set(self.driver.find_elements_by_tag_name("a")):
+                try:
+                    link = AppUrl(el.get_attribute("href"))
+                    if len(link) > 0 and in_scope(self.scope, link.url) and link not in self.fetched_urls.union(self.urls_to_fetch):
+                        if "verbosity" in self.options and self.options["verbosity"]:
+                            print(link)
+                        if callable(self.on_url_found):
+                            self.on_url_found(link)
+                        links.add(link)
+                    elif len(link) > 0 and in_scope(self.scope, link.url) and link in self.fetched_urls.union(self.urls_to_fetch):
                         if link.url in registered_links:
                             registered_links[link.url].merge(link)
                         else:
                             registered_links[link.url] = link
+                except StaleElementReferenceException:
+                    continue
 
-            except StaleElementReferenceException:
-                continue
+            for script in set(self.driver.find_elements_by_tag_name("script")):
+                try:
+                    src = AppUrl(script.get_attribute("src"))
 
-        urls_to_fetch.update(links)
-    return fetched_urls
+                    # shorthand for options["scan_all_scripts"]
+                    opt = self.options["scan_all_scripts"]
+                    if len(src) > 0 and ((not opt and in_scope(self.scope, src.url)) or opt):
+
+                        found_links = set([link for link in get_links_in_script(src) if in_scope(
+                            self.scope, link.url)])
+
+                        new_links = [link for link in found_links if link not in self.fetched_urls.union(
+                            links).union(self.urls_to_fetch) and len(link) > 0]
+                        if len(new_links) > 0:
+
+                            for link in [l for l in new_links if l not in links and l not in self.urls_to_fetch and len(l) > 0]:
+                                if "verbosity" in self.options and self.options["verbosity"]:
+                                    print(link)
+                                if callable(self.on_url_found):
+                                    self.on_url_found(link)
+
+                            links.update(new_links)
+
+                        for link in [link for link in found_links if link in self.fetched_urls.union(
+                                links).union(self.urls_to_fetch)]:
+                            if link.url in registered_links:
+                                registered_links[link.url].merge(link)
+                            else:
+                                registered_links[link.url] = link
+
+                except StaleElementReferenceException:
+                    continue
+
+            self.urls_to_fetch.update(links)
 
 
 def parseArgs():
@@ -225,9 +259,10 @@ if __name__ == "__main__":
     urls = [AppUrl(url)]
 
     try:
-        urls += [AppUrl(url)
-                 for url in get_robots_file_urls(re.match(r"https?:\/\/([\w-]+\.)+[a-z]{2,5}", url).group(0)+"/robots.txt")]
-        crawler(urls, scope, driver, **options)
+        urls += get_links_in_script(url)
+        crawler = Crawler(urls, scope, driver, **options)
+
+        crawler.crawl()
     except Exception as e:
         print(e, file=sys.stderr)
 
