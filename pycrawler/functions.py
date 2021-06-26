@@ -1,7 +1,7 @@
 import re
 import requests
 from requests.exceptions import RequestException
-from model import AppUrl
+from .model import AppUrl
 
 pattern = re.compile(r"https?:\/\/([\w\-]+\.)+[a-z]{2,5}[^\s\"\']*")
 

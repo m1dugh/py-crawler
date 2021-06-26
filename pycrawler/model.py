@@ -2,7 +2,7 @@
 class AppUrlMergeError(RuntimeError):
 
     def __init__(self, *args):
-        RuntimeError.__init__(self, args)
+        RuntimeError.__init__(self, *args)
 
 
 class AppUrl:

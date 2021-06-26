@@ -9,8 +9,8 @@ from selenium import webdriver
 from selenium.common.exceptions import (StaleElementReferenceException,
                                         WebDriverException)
 
-from model import AppUrl
-from utils import *
+from .model import AppUrl
+from .functions import *
 
 pattern = re.compile(r"https?:\/\/([\w\-]+\.)+[a-z]{2,5}[^\s\"\']*")
 
@@ -142,6 +142,7 @@ class Crawler:
                 while True:
                     try:
                         self.on_url_found(queue.get_nowait())
+                        print("called")
                     except Full:
                         break
                     except Empty:
