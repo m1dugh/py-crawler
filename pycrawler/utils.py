@@ -1,10 +1,10 @@
 import re
 import requests
 from requests.exceptions import RequestException
+
 from .model import AppUrl
 
 pattern = re.compile(r"https?:\/\/([\w\-]+\.)+[a-z]{2,5}[^\s\"\']*")
-
 
 def in_scope(scope, url):
     included = False
