@@ -5,7 +5,6 @@ from requests.exceptions import RequestException
 
 from pycrawler import Crawler
 from pycrawler.utils import get_robots_file_urls
-from pycrawler.model import AppUrl
 
 
 def parseArgs():
@@ -28,24 +27,25 @@ def parseArgs():
 
     parser.add_argument("-r", "--robots", action="store_true",
                         help="fetch robots.txt urls")
-    
-    parser.add_argument("-v", "--verbosity", type=int, default=4, choices=range(6), help="the level of verbosity starting from 1 debug to 5 critical")
+
+    parser.add_argument("-v", "--verbosity", type=str, default="error", choices={
+                        "debug", "info", "warning", "error", "critical"}, help="the level of verbosity starting from 1 debug to 5 critical")
 
     args = parser.parse_args()
 
     options = {}
-    options["verbosity"] = args.verbosity * 10
+    options["verbosity"] = args.verbosity.upper()
     options["scan_out_of_scope_scripts"] = args.scan_all_scripts
     options["threads"] = args.threads
 
     scope = json.loads(open(args.scope).read())
 
     if args.url:
-        urls = set([AppUrl(args.url)])
+        urls = set([args.url])
     elif args.urls:
         urls = set()
         for l in open(args.urls).readlines():
-            urls.add(AppUrl(l))
+            urls.add(l)
 
     if args.robots:
         robots_urls = set()
@@ -71,5 +71,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        print("closing driver ...", file=sys.stderr)
         sys.exit(0)

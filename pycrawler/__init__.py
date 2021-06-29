@@ -1,27 +1,22 @@
 import logging
 from queue import Empty, Full, Queue
 from threading import Lock, Thread
+from typing import Iterable
 
-from selenium.common.exceptions import (StaleElementReferenceException,
-                                        WebDriverException)
+from .utils import in_scope, get_links_in_script, normalize_url, get_page, extract_pure_url
 
-from .model import AppUrl
-from .utils import in_scope, get_links_in_script, normalize_url, get_page
-
-from bs4 import BeautifulSoup
 import requests
-
 
 
 class Crawler:
 
-    def __init__(self, base_urls: list[AppUrl], scope, on_url_found=None, **options):
-        self.logger = logging.getLogger()
+    def __init__(self, base_urls: Iterable[str], scope, on_url_found=None, **options):
+        self.logger = logging.getLogger("pycrawler.Crawler")
         self.logger.setLevel(options["verbosity"])
-        self.base_urls = base_urls
         self.scope = scope
         self.options = options
-        self.urls_to_fetch, self.fetched_urls = set(self.base_urls), set()
+        self.urls_to_fetch, self.fetched_urls, self.error_urls = set(
+            base_urls), dict(), dict()
         self.on_url_found = on_url_found
         self.lock = Lock()
         self.__parse_options()
@@ -33,38 +28,70 @@ class Crawler:
         if "threads" not in self.options:
             self.options["threads"] = 5
 
-    def __crawl_single_page(self, app_url: AppUrl, callback_q: Queue):
+        if "verbosity" not in self.options:
+            self.options["verbosity"] = logging.ERROR
+
+        if "max_retries" not in self.options:
+            self.options["max_retries"] = 3
+
+    def __crawl_single_page(self, url: str, callback_q: Queue):
 
         try:
-            self.logger.debug(f"fetching page {app_url.url} ...")
+            self.logger.debug(f"fetching page {url} ...")
 
-            page, infos = get_page(app_url.url)
-            link_elements = [normalize_url(app_url.url, el.get("href")) for el in page.find_all(
-                "a") if el.get("href") and len(el.get("href")) > 0]
-            link_elements = set(
-                [AppUrl(link) for link in link_elements if link and in_scope(self.scope, link)])
+            page, infos = get_page(url)
 
-            script_urls = [normalize_url(app_url.url, el.get("src")) for el in page.find_all(
-                "script") if el.get("src") and len(el.get("src")) > 0]
-            script_urls = set([AppUrl(url) for url in script_urls if url and (not self.options["scan_all_scripts"] and in_scope(
-                self.scope, url)) or self.options["scan_all_scripts"]])
-
-            self.logger.debug(
-                f"found {len(script_urls)} scripts in {app_url.url}")
+            self.lock.acquire()
+            pure_url = extract_pure_url(url)
+            if pure_url in self.fetched_urls and url in self.fetched_urls[pure_url]:
+                logging.info(
+                    f"page {url} not parsed because it has already been fetched")
+                return
+            elif pure_url in self.fetched_urls and url not in self.fetched_urls[pure_url]:
+                for inf in self.fetched_urls[pure_url].values():
+                    if inf == infos:
+                        logging.info(
+                            f"page {url} not parsed because parameters does not change the source code")
+                        return
+                self.fetched_urls[pure_url][url] = infos
+            else:
+                self.fetched_urls[pure_url] = {url: infos}
 
         except requests.RequestException as e:
             logging.warning(e)
+            if not self.lock.locked():
+                self.lock.acquire()
+            if url not in self.error_urls:
+                self.error_urls[url] = 0
+            self.error_urls[url] += 1
+            return
         finally:
-            self.lock.acquire()
-            self.fetched_urls.add(app_url)
-            self.lock.release()
+            if self.lock.locked():
+                self.lock.release()
 
-        registered_links = dict()
+        link_elements = [normalize_url(url, el.get("href")) for el in page.find_all(
+            "a") if el.get("href") and len(el.get("href")) > 0]
+        link_elements = set(
+            [l for l in link_elements if l and in_scope(self.scope, l)])
+
+        self.logger.info(f"found {len(link_elements)} links in page {url}")
+
+        script_urls = [normalize_url(url, el.get("src")) for el in page.find_all(
+            "script") if el.get("src") and len(el.get("src")) > 0]
+        script_urls = set([url for url in script_urls if url and (not self.options["scan_all_scripts"] and in_scope(
+            self.scope, url)) or self.options["scan_all_scripts"]])
+
+        self.logger.info(
+            f"found {len(script_urls)} scripts in {url}")
 
         for link in link_elements:
             self.lock.acquire()
             is_new_link = link not in self.urls_to_fetch.union(
-                self.urls_to_fetch)
+                self.fetched_urls.keys())
+            for urls in self.fetched_urls.values():
+                if link in urls:
+                    is_new_link = False
+                    break
             self.lock.release()
 
             if is_new_link:
@@ -73,66 +100,51 @@ class Crawler:
                 self.lock.acquire()
                 self.urls_to_fetch.add(link)
                 self.lock.release()
-            else:
-                if link.url in registered_links:
-                    registered_links[link.url].merge(link)
-                else:
-                    registered_links[link.url] = link
 
         for src in script_urls:
-            opt = self.options["scan_all_scripts"]
-            if len(src) > 0 and ((not opt and in_scope(self.scope, src.url)) or opt):
-                self.logger.debug(f"fetching links for page {app_url.url}")
-                found_links = set([link for link in get_links_in_script(src) if in_scope(
-                    self.scope, link.url) and len(link) > 0])
 
-                self.lock.acquire()
-                new_links = [
-                    link for link in found_links if link not in self.fetched_urls.union(self.urls_to_fetch)]
-                self.lock.release()
+            self.logger.debug(f"fetching links for page {url}")
+            found_links = set([link for link in get_links_in_script(src) if len(link) > 0 and in_scope(
+                self.scope, link)])
 
-                self.logger.debug(
-                    f"found {len(new_links)} new links for scripts in {app_url.url}")
+            self.lock.acquire()
+            new_links = [
+                link for link in found_links if link not in set(self.fetched_urls.keys()).union(self.urls_to_fetch)]
+            self.lock.release()
 
-                for link in new_links:
-                    callback_q.put(link)
+            self.logger.debug(
+                f"found {len(new_links)} new links for scripts in {url}")
 
-                self.lock.acquire()
-                self.urls_to_fetch.update(new_links)
-                old_links = [
-                    link for link in found_links if link in self.fetched_urls.union(self.urls_to_fetch)]
-                self.lock.release()
+            for link in new_links:
+                callback_q.put(link)
 
-                for link in old_links:
-                    if link.url in registered_links:
-                        registered_links[link.url].merge(link)
-                    else:
-                        registered_links[link.url] = link
+            self.lock.acquire()
+            self.urls_to_fetch.update(new_links)
+            self.lock.release()
 
-                if len(registered_links.keys()) > 0:
-                    self.fetched_urls = list(self.fetched_urls)
-                    for i in range(len(self.fetched_urls)):
-                        if self.fetched_urls[i].url in registered_links:
-                            self.fetched_urls[i].merge(
-                                registered_links[self.fetched_urls[i].url])
-                    self.fetched_urls = set(self.fetched_urls)
-            self.logger.debug(f"fetched page {app_url.url}")
+            self.logger.debug(f"fetched page {url}")
 
     def crawl(self):
         t_count = self.options["threads"]
         queue = Queue()
         threads = []
-
+        old_length = 0
         while len(threads) + len(self.urls_to_fetch) > 0:
-            for i in range(t_count - len(threads)):
-                if len(self.urls_to_fetch) > 0:
-                    self.logger.debug(
-                        f"remaining pages to fetch: {len(self.urls_to_fetch)}")
-                    threads.append(
-                        Thread(target=self.__crawl_single_page, args=(self.urls_to_fetch.pop(), queue), daemon=True))
-                    threads[-1].start()
+            while len(self.urls_to_fetch) > 0 and t_count - len(threads) > 0:
+                self.logger.debug(
+                    f"remaining pages to fetch: {len(self.urls_to_fetch)}")
+
+                url = self.urls_to_fetch.pop()
+                if url in self.error_urls and self.error_urls[url] >= self.options["max_retries"]:
+                    continue
+                threads.append(
+                    Thread(target=self.__crawl_single_page, args=(url, queue), daemon=True))
+                threads[-1].start()
 
             threads = [t for t in threads if t.is_alive()]
+            if len(threads) != old_length:
+                self.logger.debug(f"current running threads: {len(threads)}")
+                old_length = len(threads)
 
             while callable(self.on_url_found):
                 try:
