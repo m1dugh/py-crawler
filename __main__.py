@@ -1,7 +1,6 @@
 import json
 import sys
 from argparse import ArgumentParser
-from selenium import webdriver
 from requests.exceptions import RequestException
 
 from pycrawler import Crawler
@@ -11,14 +10,6 @@ from pycrawler.model import AppUrl
 
 def parseArgs():
     parser = ArgumentParser()
-    parser.add_argument(
-        "-b", "--browser", help="the browser to use", default="firefox", type=str)
-    parser.add_argument(
-        "-p", "--browser-path",
-        help="the path to the browser driver",
-        default="geckodriver",
-        type=str
-    )
 
     parser.add_argument("-s", "--scope",
                         help="the path to the json file with the scope", required=True, type=str)
@@ -41,20 +32,6 @@ def parseArgs():
     parser.add_argument("-v", "--verbosity", type=int, default=4, choices=range(6), help="the level of verbosity starting from 1 debug to 5 critical")
 
     args = parser.parse_args()
-
-    if args.browser == "chrome":
-        opt = webdriver.ChromeOptions()
-        opt.headless = True
-        if args.browser_path != "geckodriver":
-            driver = webdriver.Chrome(
-                executable_path=args.browser_path, options=opt)
-        else:
-            driver = webdriver.Chrome()
-    else:
-        opt = webdriver.FirefoxOptions()
-        opt.headless = True
-        driver = webdriver.Firefox(
-            executable_path=args.browser_path, options=opt)
 
     options = {}
     options["verbosity"] = args.verbosity * 10
@@ -80,13 +57,13 @@ def parseArgs():
 
         urls.update(robots_urls)
 
-    return urls, scope, driver, options
+    return urls, scope, options
 
 
 if __name__ == "__main__":
-    urls, scope, driver, options = parseArgs()
+    urls, scope, options = parseArgs()
 
-    crawler = Crawler(urls, scope, driver, print, **options)
+    crawler = Crawler(urls, scope, print, **options)
     try:
         crawler.crawl()
     except Exception as e:
@@ -95,5 +72,4 @@ if __name__ == "__main__":
         pass
     finally:
         print("closing driver ...", file=sys.stderr)
-        driver.close()
         sys.exit(0)

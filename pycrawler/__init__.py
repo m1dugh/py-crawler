@@ -1,4 +1,3 @@
-import re
 import logging
 from queue import Empty, Full, Queue
 from threading import Lock, Thread
@@ -7,19 +6,20 @@ from selenium.common.exceptions import (StaleElementReferenceException,
                                         WebDriverException)
 
 from .model import AppUrl
-from .utils import in_scope, get_links_in_script
+from .utils import in_scope, get_links_in_script, normalize_url, get_page
 
-pattern = re.compile(r"https?:\/\/([\w\-]+\.)+[a-z]{2,5}[^\s\"\']*")
+from bs4 import BeautifulSoup
+import requests
+
 
 
 class Crawler:
 
-    def __init__(self, base_urls: list[AppUrl], scope, driver, on_url_found=None, **options):
+    def __init__(self, base_urls: list[AppUrl], scope, on_url_found=None, **options):
         self.logger = logging.getLogger()
         self.logger.setLevel(options["verbosity"])
         self.base_urls = base_urls
         self.scope = scope
-        self.driver = driver
         self.options = options
         self.urls_to_fetch, self.fetched_urls = set(self.base_urls), set()
         self.on_url_found = on_url_found
@@ -34,37 +34,28 @@ class Crawler:
             self.options["threads"] = 5
 
     def __crawl_single_page(self, app_url: AppUrl, callback_q: Queue):
-        link_elements, script_urls = set(), set()
+
         try:
-            self.lock.acquire()
             self.logger.debug(f"fetching page {app_url.url} ...")
-            self.driver.get(app_url.url)
 
-            for el in self.driver.find_elements_by_tag_name("a"):
-                try:
-                    href = el.get_attribute("href")
-                    self.logger.debug(f"found href {href} for page {app_url.url}")
-                    if href and len(href) > 0 and type(href) == str and in_scope(self.scope, href):
-                        link_elements.add(AppUrl(href))
-                except StaleElementReferenceException:
-                    continue
+            page, infos = get_page(app_url.url)
+            link_elements = [normalize_url(app_url.url, el.get("href")) for el in page.find_all(
+                "a") if el.get("href") and len(el.get("href")) > 0]
+            link_elements = set(
+                [AppUrl(link) for link in link_elements if link and in_scope(self.scope, link)])
 
-            self.logger.debug(f"found {len(link_elements)} links in {app_url.url}")
+            script_urls = [normalize_url(app_url.url, el.get("src")) for el in page.find_all(
+                "script") if el.get("src") and len(el.get("src")) > 0]
+            script_urls = set([AppUrl(url) for url in script_urls if url and (not self.options["scan_all_scripts"] and in_scope(
+                self.scope, url)) or self.options["scan_all_scripts"]])
 
-            for el in self.driver.find_elements_by_tag_name("script"):
-                try:
-                    src = el.get_attribute("src")
-                    if src and len(src) > 0 and type(src) == str:
-                        if (not self.options["scan_all_scripts"] and in_scope(self.scope, src)) or self.options["scan_all_scripts"]:
-                            script_urls.add(AppUrl(src))
-                except StaleElementReferenceException:
-                    continue
+            self.logger.debug(
+                f"found {len(script_urls)} scripts in {app_url.url}")
 
-            self.logger.debug(f"found {len(script_urls)} scripts in {app_url.url}")
-
-        except WebDriverException as e:
+        except requests.RequestException as e:
             logging.warning(e)
         finally:
+            self.lock.acquire()
             self.fetched_urls.add(app_url)
             self.lock.release()
 
