@@ -29,13 +29,13 @@ def parseArgs():
                         help="fetch robots.txt urls")
 
     parser.add_argument("-v", "--verbosity", type=str, default="error", choices={
-                        "debug", "info", "warning", "error", "critical"}, help="the level of verbosity starting from 1 debug to 5 critical")
+                        "debug", "info", "warning", "error", "critical"}, help="the level of verbosity (debug > info > warning > error > critical)")
 
     args = parser.parse_args()
 
     options = {}
     options["verbosity"] = args.verbosity.upper()
-    options["scan_out_of_scope_scripts"] = args.scan_all_scripts
+    options["scan_all_scripts"] = args.scan_all_scripts
     options["threads"] = args.threads
 
     scope = json.loads(open(args.scope).read())
